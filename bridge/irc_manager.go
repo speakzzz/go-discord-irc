@@ -143,16 +143,16 @@ func (m *IRCManager) puppetNickOwner(nick string) (*ircConnection, bool) {
 	return nil, false
 }
 
-// mentionReplacements returns old/new pairs turning puppet nicks into
-// Discord mentions, for use with strings.NewReplacer.
-func (m *IRCManager) mentionReplacements() []string {
+// mentionMap maps each puppet's nick (folded with ircLower) to the
+// Discord mention for its user.
+func (m *IRCManager) mentionMap() map[string]string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	replacements := make([]string, 0, len(m.ircConnections)*2)
+	mentions := make(map[string]string, len(m.ircConnections))
 	for _, con := range m.ircConnections {
-		replacements = append(replacements, con.nick, "<@!"+con.uid+">")
+		mentions[ircLower(con.nick)] = "<@!" + con.uid + ">"
 	}
-	return replacements
+	return mentions
 }
 
 // setConnectionNick records the nick the server actually gave a puppet.

@@ -70,6 +70,18 @@ type Config struct {
 	// Maximum Nicklength for irc server
 	MaxNickLength int
 
+	// DiscordMarkdownToIRC converts Discord markdown (**bold**, `code`, ...)
+	// into IRC formatting codes.
+	DiscordMarkdownToIRC bool
+
+	// DiscordEdits is how message edits are relayed: EditsFull,
+	// EditsCompact or EditsOff.
+	DiscordEdits string
+
+	// IRCTopicToDiscord is how IRC topic changes reach Discord: TopicMessage,
+	// TopicSync, TopicBoth or TopicOff.
+	IRCTopicToDiscord string
+
 	// RejoinInterval is how often to retry joining mapped channels that the
 	// listener or a puppet is not in. Zero disables retrying.
 	RejoinInterval time.Duration
@@ -131,6 +143,29 @@ func (b *Bridge) readConfig(fn func(c *Config)) {
 func (b *Bridge) avatarURL() (url string) {
 	b.readConfig(func(c *Config) { url = c.AvatarURL })
 	return
+}
+
+func (b *Bridge) convertDiscordMarkdown() (on bool) {
+	b.readConfig(func(c *Config) { on = c.DiscordMarkdownToIRC })
+	return
+}
+
+func (b *Bridge) discordEditsMode() (mode string) {
+	b.readConfig(func(c *Config) { mode = c.DiscordEdits })
+	switch mode {
+	case EditsFull, EditsCompact, EditsOff:
+		return mode
+	}
+	return EditsFull
+}
+
+func (b *Bridge) ircTopicMode() (mode string) {
+	b.readConfig(func(c *Config) { mode = c.IRCTopicToDiscord })
+	switch mode {
+	case TopicMessage, TopicSync, TopicBoth, TopicOff:
+		return mode
+	}
+	return TopicOff
 }
 
 // Mappings returns a copy of the current channel mappings.

@@ -124,6 +124,13 @@ func main() {
 	// Maximum length of user nicks aloud
 	viper.SetDefault("max_nick_length", ircnick.MAXLENGTH)
 	maxNickLength := viper.GetInt("max_nick_length")
+	// Discord **markdown** -> IRC formatting codes
+	viper.SetDefault("discord_markdown", true)
+	// How Discord edits reach IRC: full, compact or off
+	viper.SetDefault("discord_edits", bridge.EditsCompact)
+	// How IRC topic changes reach Discord: message, topic, both or off
+	viper.SetDefault("irc_topic_to_discord", bridge.TopicMessage)
+
 	// How often to retry joining channels we are not in (0 disables)
 	viper.SetDefault("rejoin_interval", 300)
 	rejoinInterval := viper.GetInt64("rejoin_interval")
@@ -177,6 +184,9 @@ func main() {
 		ShowJoinQuit:               showJoinQuit,
 		MaxNickLength:              maxNickLength,
 		RejoinInterval:             time.Second * time.Duration(rejoinInterval),
+		DiscordMarkdownToIRC:       viper.GetBool("discord_markdown"),
+		DiscordEdits:               checkChoice("discord_edits", viper.GetString("discord_edits"), bridge.EditsCompact, bridge.EditsFull, bridge.EditsCompact, bridge.EditsOff),
+		IRCTopicToDiscord:          checkChoice("irc_topic_to_discord", viper.GetString("irc_topic_to_discord"), bridge.TopicMessage, bridge.TopicMessage, bridge.TopicSync, bridge.TopicBoth, bridge.TopicOff),
 
 		Debug:         *debugMode,
 		DebugPresence: *debugPresence,
@@ -220,6 +230,9 @@ func main() {
 		discordFilter := setupFilter(viper.GetStringSlice("discord_message_filter"))
 		ircFilter := setupFilter(viper.GetStringSlice("irc_message_filter"))
 		avatarURL := viper.GetString("avatar_url")
+		discordMarkdown := viper.GetBool("discord_markdown")
+		discordEdits := checkChoice("discord_edits", viper.GetString("discord_edits"), bridge.EditsCompact, bridge.EditsFull, bridge.EditsCompact, bridge.EditsOff)
+		topicMode := checkChoice("irc_topic_to_discord", viper.GetString("irc_topic_to_discord"), bridge.TopicMessage, bridge.TopicMessage, bridge.TopicSync, bridge.TopicBoth, bridge.TopicOff)
 		discordIgnores := stringSliceToMap(viper.GetStringSlice("ignored_discord_ids"))
 
 		var discordAllowed map[string]struct{}
@@ -232,6 +245,9 @@ func main() {
 			c.DiscordFilteredMessages = discordFilter
 			c.IRCFilteredMessages = ircFilter
 			c.AvatarURL = avatarURL
+			c.DiscordMarkdownToIRC = discordMarkdown
+			c.DiscordEdits = discordEdits
+			c.IRCTopicToDiscord = topicMode
 			c.DiscordIgnores = discordIgnores
 			c.DiscordAllowed = discordAllowed
 		})
@@ -266,6 +282,18 @@ func main() {
 
 	// Cleanly close down the bridge.
 	dib.Close()
+}
+
+// checkChoice returns value if it is one of allowed, otherwise logs a warning
+// and returns fallback.
+func checkChoice(key, value, fallback string, allowed ...string) string {
+	for _, a := range allowed {
+		if value == a {
+			return value
+		}
+	}
+	log.Warnf("Invalid %s %q (expected one of %s), using %q", key, value, strings.Join(allowed, ", "), fallback)
+	return fallback
 }
 
 func stringSliceToMap(list []string) map[string]struct{} {

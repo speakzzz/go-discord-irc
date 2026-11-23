@@ -23,6 +23,13 @@ type discordBot struct {
 	guildID string
 
 	transmitter *transmitter.Transmitter
+
+	// relayed remembers what we last sent to IRC for recent messages, so
+	// edits can be compared with it.
+	relayed *messageCache
+
+	// topics sets Discord channel topics from IRC.
+	topics *topicSyncer
 }
 
 func newDiscord(bridge *Bridge, botToken, guildID string) (*discordBot, error) {
@@ -39,6 +46,8 @@ func newDiscord(bridge *Bridge, botToken, guildID string) (*discordBot, error) {
 		bridge:  bridge,
 
 		guildID: guildID,
+		relayed: newMessageCache(2000),
+		topics:  newTopicSyncer(),
 	}
 
 	// These events are all fired in separate goroutines
@@ -130,6 +139,13 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 		}
 	}
 
+	// Turn **bold**, *italic*, `code` etc. into IRC formatting. Done on the
+	// raw content so nicks substituted for mentions below are never parsed
+	// as markdown.
+	if d.bridge.convertDiscordMarkdown() {
+		m.Content = discordMarkdownToIRC(m.Content)
+	}
+
 	// HACK: this is before d.ParseText so that the existing <@uid> translation logic can be used
 	if m.MessageReference != nil && m.MessageReference.ChannelID == m.ChannelID {
 		prefix := "[reply]"
@@ -145,11 +161,6 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 	}
 
 	content := d.ParseText(m)
-
-	if wasEdit {
-		// IsAction below still makes edited actions go out as CTCP ACTION.
-		content = "[edit] " + content
-	}
 
 	if strings.Count(content, "||") >= 2 {
 		content = spoilerPattern.ReplaceAllString(content, colorCode+"1,1$1"+colorCode)
@@ -175,11 +186,26 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 		}
 	}
 
+	if wasEdit {
+		var relay bool
+		content, isAction, relay = d.editToRelay(m.ID, content, isAction)
+		if !relay {
+			return
+		}
+	} else {
+		d.relayed.put(m.ID, content)
+	}
+
 	d.bridge.discordMessageEventsChan <- &DiscordMessage{
 		Message:  m,
 		Content:  content,
 		IsAction: isAction,
 		PmTarget: pmTarget,
+	}
+
+	// Attachments were already relayed with the original message.
+	if wasEdit {
+		return
 	}
 
 	for _, attachment := range m.Attachments {

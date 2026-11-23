@@ -25,13 +25,20 @@ func newTestBridge(t *testing.T) *Bridge {
 			CooldownDuration: time.Hour,
 		},
 		updateUserChan:      make(chan DiscordUser, 16),
+		discordMessagesChan: make(chan IRCMessage, 16),
 		cooldownExpiredChan: make(chan cooldownExpiry, 16),
 		emoji:               map[string]*discordgo.Emoji{},
 	}
 
 	state := discordgo.NewState()
 	require.NoError(t, state.GuildAdd(&discordgo.Guild{ID: "guild"}))
-	b.discord = &discordBot{Session: &discordgo.Session{State: state}, bridge: b, guildID: "guild"}
+	b.discord = &discordBot{
+		Session: &discordgo.Session{State: state},
+		bridge:  b,
+		guildID: "guild",
+		relayed: newMessageCache(100),
+		topics:  newTopicSyncer(),
+	}
 	b.ircListener = &ircListener{
 		Connection:          irc.IRC("listener", "discord"),
 		bridge:              b,
@@ -241,7 +248,7 @@ func TestManagerConcurrentAccess(t *testing.T) {
 					return
 				default:
 				}
-				_ = m.mentionReplacements()
+				_ = m.mentionMap()
 				_ = m.isPuppetNick("user5_d2")
 				_, _ = m.nickForUID("5")
 				_, _ = m.puppetNickOwner("USER5_D2")

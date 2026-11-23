@@ -60,6 +60,10 @@ func newIRCListener(dib *Bridge, webIRCPass string) *ircListener {
 		irccon.AddCallback(code, safeCallback("listener "+code, cb))
 	}
 
+	// Topic changes, and the current topic when we join
+	irccon.AddCallback("TOPIC", safeCallback("listener TOPIC", listener.onTopicChange))
+	irccon.AddCallback("332", safeCallback("listener 332", listener.onTopicReply))
+
 	irccon.AddCallback("900", safeCallback("listener 900", func(e *irc.Event) {
 		// Try to rejoin channels after authenticated with NickServ
 		listener.JoinChannels()
@@ -320,11 +324,7 @@ func (i *ircListener) OnPrivateMessage(e *irc.Event) {
 		return
 	}
 
-	replacements := i.bridge.ircManager.mentionReplacements()
-
-	msg := strings.NewReplacer(
-		replacements...,
-	).Replace(e.Message())
+	msg := replaceNickMentions(e.Message(), i.bridge.ircManager.mentionMap())
 
 	if e.Code == "CTCP_ACTION" {
 		msg = "_" + msg + "_"

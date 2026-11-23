@@ -14,11 +14,13 @@ var joinFailureCodes = []string{
 	"403", // ERR_NOSUCHCHANNEL
 	"405", // ERR_TOOMANYCHANNELS
 	"437", // ERR_UNAVAILRESOURCE (channel juped / temporarily unavailable)
+	"470", // ERR_LINKCHANNEL (charybdis/Solanum: forwarded elsewhere by +f)
 	"471", // ERR_CHANNELISFULL (+l)
 	"473", // ERR_INVITEONLYCHAN (+i)
 	"474", // ERR_BANNEDFROMCHAN (+b)
 	"475", // ERR_BADCHANNELKEY (+k)
 	"477", // ERR_NEEDREGGEDNICK (+r, must be logged in)
+	"480", // ERR_THROTTLE (charybdis/Solanum: join throttle +j)
 	"489", // ERR_SECUREONLYCHAN / voice needed, depending on ircd
 }
 

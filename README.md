@@ -91,6 +91,9 @@ The config file is a yaml formatted file with the following fields:
 | `webirc_pass`                   | No               |                                                | Yes                          | optional, but recommended for regular (non-simple) usage. this must be obtained by the IRC sysops                                                                        |
 | `irc_listener_prejoin_commands` | Yes              |                                                | Yes                          | list of commands for the listener IRC connection to execute (right before joining channels)                                                                              |
 | `irc_puppet_prejoin_commands`   | Yes              | `MODE ${NICK} +${DEAF}`                        | Yes                          | list of commands for each Puppet IRC connection to execute (right before joining channels). `${NICK}` is the puppet's nick; `${DEAF}` is the server's deaf user mode (ISUPPORT `DEAF`, else `d`) |
+| `discord_markdown`              | No               | true                                           | Yes                          | convert Discord markdown (`**bold**`, `*italic*`, `__underline__`, `~~strike~~`, `` `code` ``, code blocks, headers, masked links) into IRC formatting codes |
+| `discord_edits`                 | No               | `compact`                                      | Yes                          | how Discord message edits are relayed: `compact` sends small changes as `s/old/new/` (otherwise like `full`), `full` sends `[edit] <whole message>`, `off` ignores edits. Edits that don't change the text (e.g. link previews) are never relayed |
+| `irc_topic_to_discord`          | No               | `message`                                      | Yes                          | how IRC topic changes reach Discord: `message` posts "nick changed the topic to: ...", `topic` sets the Discord channel topic (needs Manage Channels; Discord rate-limits topic edits), `both`, or `off` |
 | `rejoin_interval`               | Yes              | 300                                            | Yes                          | seconds between retrying mapped channels the listener or a puppet failed to join (refusals are logged with the server's reason). `0` disables retrying               |
 | `debug`                         | Yes              | false                                          | Yes                          | debug mode                                                                                                                                                               |
 | `insecure`,                     | Yes              | false                                          | Yes                          | TLS will skip verification (but still uses TLS)                                                                                                                          |
@@ -132,6 +135,15 @@ Make sure you give the message content intent too:
 First edit `config.yml` file to your needs.
 Then launch `docker build -t go-discord-irc .` in the repository root folder.
 And then `docker run -d go-discord-irc` to run the bot in background.
+
+The image is built with Go 1.26 (override with `--build-arg GOLANG_VERSION=...`)
+and only contains the binary and its config. To use a config from the host
+instead of the one baked into the image:
+
+```
+docker run -d --restart unless-stopped \
+  -v "$PWD/config.yml:/bot/config.yml:ro" go-discord-irc
+```
 
 ## Development
 
