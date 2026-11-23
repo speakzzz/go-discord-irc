@@ -4,7 +4,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"regexp"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -80,6 +82,9 @@ type Bridge struct {
 	ircListener *ircListener
 	ircManager  *IRCManager
 
+	// mappings and ircChannelKeys are replaced on config reload (from the
+	// config watcher goroutine) and read everywhere, so guard them.
+	mappingsMu     sync.RWMutex
 	mappings       []Mapping
 	ircChannelKeys map[string]string // From "#test" to "password"
 
@@ -89,8 +94,42 @@ type Bridge struct {
 	discordMessageEventsChan chan *DiscordMessage
 	updateUserChan           chan DiscordUser
 	removeUserChan           chan string // user id
+	cooldownExpiredChan      chan cooldownExpiry
 
-	emoji map[string]*discordgo.Emoji
+	emojiMu sync.RWMutex
+	emoji   map[string]*discordgo.Emoji
+}
+
+// Mappings returns a copy of the current channel mappings.
+func (b *Bridge) Mappings() []Mapping {
+	b.mappingsMu.RLock()
+	defer b.mappingsMu.RUnlock()
+	return append([]Mapping(nil), b.mappings...)
+}
+
+func (b *Bridge) setEmoji(emoji map[string]*discordgo.Emoji) {
+	b.emojiMu.Lock()
+	b.emoji = emoji
+	b.emojiMu.Unlock()
+}
+
+func (b *Bridge) lookupEmoji(name string) (*discordgo.Emoji, bool) {
+	b.emojiMu.RLock()
+	defer b.emojiMu.RUnlock()
+	e, ok := b.emoji[name]
+	return e, ok
+}
+
+// recoverAndLog is deferred at the top of event handlers so that one bad
+// event is logged instead of crashing the whole bridge.
+func recoverAndLog(where string) {
+	if r := recover(); r != nil {
+		log.WithFields(log.Fields{
+			"handler": where,
+			"panic":   r,
+		}).Errorln("recovered from panic in event handler")
+		log.Errorln(string(debug.Stack()))
+	}
 }
 
 // Close the Bridge
@@ -150,9 +189,11 @@ func (b *Bridge) SetChannelMappings(inMappings map[string]string) error {
 		}
 	}
 
+	b.mappingsMu.Lock()
 	oldMappings := b.mappings
 	b.mappings = mappings
 	b.ircChannelKeys = ircChannelKeys
+	b.mappingsMu.Unlock()
 
 	// If doing some changes mid-bot
 	if oldMappings != nil {
@@ -212,14 +253,17 @@ func (b *Bridge) SetChannelMappings(inMappings map[string]string) error {
 			}
 		}
 
-		b.ircListener.SendRaw("PART " + strings.Join(rmChannels, ","))
-		if err := b.ircManager.varys.SendRaw("", varys.InterpolationParams{}, "PART "+strings.Join(rmChannels, ",")); err != nil {
-			panic(err.Error())
+		if len(rmChannels) > 0 {
+			part := "PART " + strings.Join(rmChannels, ",")
+			b.ircListener.SendRaw(part)
+			if err := b.ircManager.varys.SendRaw("", varys.InterpolationParams{}, part); err != nil {
+				log.WithError(err).Errorln("could not part puppets from removed channels")
+			}
 		}
 
 		// The bots needs to join the new mappings
 		b.ircListener.JoinChannels()
-		for _, conn := range b.ircManager.ircConnections {
+		for _, conn := range b.ircManager.allConnections() {
 			conn.JoinChannels()
 		}
 	}
@@ -237,6 +281,7 @@ func New(conf *Config) (*Bridge, error) {
 		discordMessageEventsChan: make(chan *DiscordMessage),
 		updateUserChan:           make(chan DiscordUser),
 		removeUserChan:           make(chan string),
+		cooldownExpiredChan:      make(chan cooldownExpiry),
 
 		emoji: make(map[string]*discordgo.Emoji),
 	}
@@ -318,9 +363,13 @@ func (b *Bridge) SetupIRCConnection(con *irc.Connection, hostname, ip string) {
 	}
 }
 
-// GetJoinCommand produces a JOIN command based on the provided mappings
+// GetJoinCommand produces a JOIN command based on the provided mappings.
+// It returns an empty string if there is nothing to join.
 func (b *Bridge) GetJoinCommand(mappings []Mapping) string {
 	var channels, keyedChannels, keys []string
+
+	b.mappingsMu.RLock()
+	defer b.mappingsMu.RUnlock()
 
 	for _, mapping := range mappings {
 		channel := mapping.IRCChannel
@@ -334,16 +383,24 @@ func (b *Bridge) GetJoinCommand(mappings []Mapping) string {
 		}
 	}
 
-	// Just append normal channels to the end of keyed channelsG
+	// Just append normal channels to the end of keyed channels
 	keyedChannels = append(keyedChannels, channels...)
 
-	return "JOIN " + strings.Join(keyedChannels, ",") + " " + strings.Join(keys, ",")
+	if len(keyedChannels) == 0 {
+		return ""
+	}
+
+	cmd := "JOIN " + strings.Join(keyedChannels, ",")
+	if len(keys) > 0 {
+		cmd += " " + strings.Join(keys, ",")
+	}
+	return cmd
 }
 
 // GetMappingByIRC returns a Mapping for a given IRC channel.
 // Returns nil if a Mapping does not exist.
 func (b *Bridge) GetMappingByIRC(channel string) (Mapping, bool) {
-	for _, mapping := range b.mappings {
+	for _, mapping := range b.Mappings() {
 		if strings.EqualFold(mapping.IRCChannel, channel) {
 			return mapping, true
 		}
@@ -354,7 +411,7 @@ func (b *Bridge) GetMappingByIRC(channel string) (Mapping, bool) {
 // GetMappingByDiscord returns a Mapping for a given Discord channel.
 // Returns nil if a Mapping does not exist.
 func (b *Bridge) GetMappingByDiscord(channel string) (Mapping, bool) {
-	for _, mapping := range b.mappings {
+	for _, mapping := range b.Mappings() {
 		if mapping.DiscordChannel == channel {
 			return mapping, true
 		}
@@ -408,7 +465,7 @@ func (b *Bridge) loop() {
 
 			// Convert any emoji ye?
 			content = emojiRegex.ReplaceAllStringFunc(content, func(emoji string) string {
-				e, ok := b.emoji[strings.ToLower(emoji[1:len(emoji)-1])]
+				e, ok := b.lookupEmoji(strings.ToLower(emoji[1 : len(emoji)-1]))
 				if !ok {
 					return emoji
 				}
@@ -484,6 +541,10 @@ func (b *Bridge) loop() {
 
 		case userID := <-b.removeUserChan:
 			b.ircManager.DisconnectUser(userID)
+
+		// A puppet's offline cooldown ran out
+		case ev := <-b.cooldownExpiredChan:
+			b.ircManager.expireCooldown(ev)
 
 		// Done!
 		case <-b.done:

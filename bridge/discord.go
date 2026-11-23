@@ -110,6 +110,18 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 		return
 	}
 
+	// Work on a copy: m may be discordgo's cached state object, which other
+	// goroutines read, and we rewrite Content and Mentions below.
+	msgCopy := *m
+	m = &msgCopy
+	m.Mentions = append([]*discordgo.User(nil), m.Mentions...)
+
+	// The message is an action if the raw content is wrapped in "_..._".
+	// Decide this on the raw content and strip the underscores before any
+	// rewriting, since ParseText changes the length of the content.
+	var isAction bool
+	m.Content, isAction = splitAction(m.Content)
+
 	// If the message is "ping" reply with "Pong!"
 	if m.Content == "ping" {
 		_, err := s.ChannelMessageSend(m.ChannelID, "Pong!")
@@ -122,7 +134,7 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 	if m.MessageReference != nil && m.MessageReference.ChannelID == m.ChannelID {
 		prefix := "[reply]"
 		msg, err := dstate.ChannelMessage(d.Session, m.MessageReference.ChannelID, m.MessageReference.MessageID)
-		if err == nil {
+		if err == nil && msg.Author != nil {
 			prefix = userToMention(msg.Author) + ":"
 			if !msg.Author.Bot {
 				// HACK: theoretically could already be there, thereotically not a big problem
@@ -134,21 +146,8 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 
 	content := d.ParseText(m)
 
-	// The content is an action if it matches "_(.+)_"
-	isAction := len(content) > 2 &&
-		m.Content[0] == '_' &&
-		m.Content[len(content)-1] == '_'
-
-	// If it is an action, remove the enclosing underscores
-	if isAction {
-		content = content[1 : len(m.Content)-1]
-	}
-
 	if wasEdit {
-		if isAction {
-			content = "/me " + content
-		}
-
+		// IsAction below still makes edited actions go out as CTCP ACTION.
 		content = "[edit] " + content
 	}
 
@@ -211,9 +210,14 @@ func (d *discordBot) publishReaction(s *discordgo.Session, r *discordgo.MessageR
 		GuildID:   r.GuildID,
 	}
 
-	originalMessage, err := dstate.ChannelMessage(d.Session, r.ChannelID, r.MessageID)
+	cachedMessage, err := dstate.ChannelMessage(d.Session, r.ChannelID, r.MessageID)
 	reactionTarget := ""
-	if err == nil {
+	if err == nil && cachedMessage.Author != nil {
+		// Copy, so we don't modify discordgo's cached message.
+		msgCopy := *cachedMessage
+		originalMessage := &msgCopy
+		originalMessage.Mentions = append([]*discordgo.User(nil), originalMessage.Mentions...)
+
 		// TODO 1: could add extra logic to figure out what length is needed to disambiguate
 		// TODO 2: length should not cause command to exceed the max command length
 
@@ -251,6 +255,15 @@ func (d *discordBot) publishReaction(s *discordgo.Session, r *discordgo.MessageR
 	}
 }
 
+// splitAction reports whether raw Discord content is an action ("_text_",
+// i.e. what /me produces) and returns the content without the underscores.
+func splitAction(raw string) (string, bool) {
+	if len(raw) > 2 && raw[0] == '_' && raw[len(raw)-1] == '_' {
+		return raw[1 : len(raw)-1], true
+	}
+	return raw, false
+}
+
 // Up to date as of https://git.io/v5kJg
 var channelMention = regexp.MustCompile(`<#(\d+)>`)
 var roleMention = regexp.MustCompile(`<@&(\d+)>`)
@@ -265,12 +278,7 @@ func (d *discordBot) ParseText(m *discordgo.Message) string {
 
 	for _, user := range m.Mentions {
 		// Find the irc username with the discord ID in irc connections
-		username := ""
-		for _, u := range d.bridge.ircManager.ircConnections {
-			if u.discord.ID == user.ID {
-				username = u.nick
-			}
-		}
+		username, _ := d.bridge.ircManager.nickForUID(user.ID)
 
 		if username == "" {
 			// Nickname is their username by default
@@ -289,7 +297,7 @@ func (d *discordBot) ParseText(m *discordgo.Message) string {
 				Nick:          nick,
 				Bot:           user.Bot,
 				Online:        false,
-			})
+			}, false)
 
 			log.WithFields(log.Fields{
 				"discord-username": user.Username,
@@ -346,7 +354,8 @@ func (d *discordBot) ParseText(m *discordgo.Message) string {
 			return "#deleted-channel"
 		}
 
-		panic(errors.Wrap(err, "Channel mention failed for "+str))
+		log.WithError(err).WithField("mention", str).Warnln("channel mention lookup failed")
+		return str
 	})
 
 	// Replace <@&xxxxx> role mentions
@@ -361,7 +370,8 @@ func (d *discordBot) ParseText(m *discordgo.Message) string {
 			return "@deleted-role"
 		}
 
-		panic(errors.Wrap(err, "Channel mention failed for "+str))
+		log.WithError(err).WithField("mention", str).Warnln("role mention lookup failed")
+		return str
 	})
 
 	// Replace emotes
@@ -404,13 +414,13 @@ func isStatusOnline(status discordgo.Status) bool {
 
 func (d *discordBot) sendUpdateUserChan(user DiscordUser) bool {
 	// Only log this for online events, because offline events won't have this
-	if (user.Username == "" || user.Discriminator == "") && user.Online {
+	if user.Username == "" && user.Online {
 		log.WithFields(log.Fields{
-			"err":                errors.WithStack(errors.New("Username or Discriminator is empty")).Error(),
+			"err":                errors.WithStack(errors.New("Username is empty")).Error(),
 			"user.Username":      user.Username,
 			"user.Discriminator": user.Discriminator,
 			"user.ID":            user.ID,
-		}).Println("sendUpdateUserChan called with empty Username and Discriminator (see stack below)")
+		}).Println("sendUpdateUserChan called with empty Username (see stack below)")
 		debug.PrintStack()
 	}
 
@@ -423,14 +433,22 @@ func (d *discordBot) GetAvatar(guildID, username string) (_ string) {
 	// First get all members
 	guild, err := d.Session.State.Guild(guildID)
 	if err != nil {
-		panic(err)
+		log.WithError(err).WithField("guild", guildID).Warnln("could not get guild for avatar lookup")
+		return
 	}
+
+	// guild.Members is updated by discordgo from other goroutines.
+	d.Session.State.RLock()
+	defer d.Session.State.RUnlock()
 
 	// Matching members
 	var foundMember *discordgo.Member
 
 	// Try and find an exact case-sensitive match
 	for _, member := range guild.Members {
+		if member.User == nil {
+			continue
+		}
 		if (username != member.Nick) && (username != member.User.Username) {
 			continue
 		}
@@ -446,6 +464,9 @@ func (d *discordBot) GetAvatar(guildID, username string) (_ string) {
 	// If no member found, check case-insensitively
 	if foundMember == nil {
 		for _, member := range guild.Members {
+			if member.User == nil {
+				continue
+			}
 			if !strings.EqualFold(username, member.Nick) && !strings.EqualFold(username, member.User.Username) {
 				continue
 			}
@@ -465,6 +486,40 @@ func (d *discordBot) GetAvatar(guildID, username string) (_ string) {
 	}
 
 	return discordgo.EndpointUserAvatar(foundMember.User.ID, foundMember.User.Avatar)
+}
+
+// nameClashesWithMember reports whether some other guild member's display
+// name sanitises to the same IRC nick as nick.
+func (d *discordBot) nameClashesWithMember(uid, nick string) bool {
+	guild, err := d.Session.State.Guild(d.bridge.Config.GuildID)
+	if err != nil {
+		log.WithError(err).Warnln("nickgen: guild not found when generating nickname")
+		return false
+	}
+
+	d.Session.State.RLock()
+	defer d.Session.State.RUnlock()
+
+	for _, member := range guild.Members {
+		if member.User == nil || member.User.ID == uid {
+			continue
+		}
+
+		name := member.Nick
+		if member.Nick == "" {
+			name = member.User.Username
+		}
+
+		if name == "" {
+			log.WithField("member", member).Errorln("blank username encountered")
+			continue
+		}
+
+		if strings.EqualFold(sanitiseNickname(name), nick) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetMemberNick returns the real display name for a Discord GuildMember

@@ -9,35 +9,52 @@ import (
 )
 
 func (d *discordBot) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
+	defer recoverAndLog("discord onMessageCreate")
+
 	d.publishMessage(s, m.Message, false)
 }
 
 func (d *discordBot) onMessageUpdate(s *discordgo.Session, m *discordgo.MessageUpdate) {
+	defer recoverAndLog("discord onMessageUpdate")
+
 	d.publishMessage(s, m.Message, true)
 }
 
 func (d *discordBot) OnMessageReactionAdd(s *discordgo.Session, m *discordgo.MessageReactionAdd) {
+	defer recoverAndLog("discord OnMessageReactionAdd")
+
 	d.publishReaction(s, m.MessageReaction)
 }
 
 // onMemberListChunk is fired in response to our GuildMembers request in OnReady
 func (d *discordBot) onMemberListChunk(s *discordgo.Session, m *discordgo.GuildMembersChunk) {
+	defer recoverAndLog("discord onMemberListChunk")
+
 	for _, m := range m.Members {
 		d.handleMemberUpdate(m, false)
 	}
 }
 
 func (d *discordBot) onMemberUpdate(s *discordgo.Session, m *discordgo.GuildMemberUpdate) {
+	defer recoverAndLog("discord onMemberUpdate")
+
 	d.handleMemberUpdate(m.Member, false)
 }
 
 // onMemberLeave is triggered when a user is removed from a guild (leave/kick/ban).
 func (d *discordBot) onMemberLeave(s *discordgo.Session, m *discordgo.GuildMemberRemove) {
+	defer recoverAndLog("discord onMemberLeave")
+
+	if m.Member == nil || m.User == nil {
+		return
+	}
 	d.bridge.removeUserChan <- m.User.ID
 }
 
 // What does this do? Probably what it sounds like.
 func (d *discordBot) OnPresencesReplace(s *discordgo.Session, m *discordgo.PresencesReplace) {
+	defer recoverAndLog("discord OnPresencesReplace")
+
 	for _, p := range *m {
 		d.handlePresenceUpdate(p.User.ID, p.Status, false)
 	}
@@ -45,10 +62,14 @@ func (d *discordBot) OnPresencesReplace(s *discordgo.Session, m *discordgo.Prese
 
 // Handle when presence is updated
 func (d *discordBot) OnPresenceUpdate(s *discordgo.Session, m *discordgo.PresenceUpdate) {
+	defer recoverAndLog("discord OnPresenceUpdate")
+
 	d.handlePresenceUpdate(m.Presence.User.ID, m.Presence.Status, false)
 }
 
 func (d *discordBot) OnTypingStart(s *discordgo.Session, m *discordgo.TypingStart) {
+	defer recoverAndLog("discord OnTypingStart")
+
 	status := discordgo.StatusOffline
 
 	p, err := d.Session.State.Presence(d.guildID, m.UserID)
@@ -64,6 +85,8 @@ func (d *discordBot) OnTypingStart(s *discordgo.Session, m *discordgo.TypingStar
 }
 
 func (d *discordBot) OnReady(s *discordgo.Session, m *discordgo.Ready) {
+	defer recoverAndLog("discord OnReady")
+
 	// Fires a GuildMembersChunk event
 	err := d.Session.RequestGuildMembers(d.guildID, "", 0, "", true)
 	if err != nil {
@@ -78,14 +101,20 @@ func (d *discordBot) OnReady(s *discordgo.Session, m *discordgo.Ready) {
 }
 
 func (d *discordBot) onGuildEmojiUpdate(s *discordgo.Session, m *discordgo.GuildEmojisUpdate) {
+	defer recoverAndLog("discord onGuildEmojiUpdate")
+
 	d.setGuildEmoji(m.GuildID, m.Emojis)
 }
 
 func (d *discordBot) setGuildEmoji(guild string, emoji []*discordgo.Emoji) {
-	d.bridge.emoji = make(map[string]*discordgo.Emoji)
-	for _, e := range emoji {
-		d.bridge.emoji[strings.ToLower(e.Name)] = e
+	if guild != d.guildID {
+		return
 	}
+	m := make(map[string]*discordgo.Emoji, len(emoji))
+	for _, e := range emoji {
+		m[strings.ToLower(e.Name)] = e
+	}
+	d.bridge.setEmoji(m)
 }
 
 func (d *discordBot) handleMemberUpdate(m *discordgo.Member, forceOnline bool) {

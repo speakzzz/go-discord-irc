@@ -8,28 +8,49 @@ import (
 	"crypto/tls"
 	"fmt"
 	"strings"
+	"sync"
 
 	irc "github.com/qaisjp/go-ircevent"
 )
 
 type Varys struct {
 	connConfig SetupParams
+
+	// mu guards uidToConns, which is used from the bridge loop and from
+	// IRC callback goroutines.
+	mu         sync.RWMutex
 	uidToConns map[string]*irc.Connection
+}
+
+func (v *Varys) conn(uid string) (*irc.Connection, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	conn, ok := v.uidToConns[uid]
+	return conn, ok
 }
 
 func NewVarys() *Varys {
 	return &Varys{uidToConns: make(map[string]*irc.Connection)}
 }
 
+// connCall runs fn on one connection, or all of them if uid is blank.
+// fn is called without holding the lock.
 func (v *Varys) connCall(uid string, fn func(*irc.Connection)) {
 	if uid == "" {
+		v.mu.RLock()
+		conns := make([]*irc.Connection, 0, len(v.uidToConns))
 		for _, conn := range v.uidToConns {
+			conns = append(conns, conn)
+		}
+		v.mu.RUnlock()
+
+		for _, conn := range conns {
 			fn(conn)
 		}
 		return
 	}
 
-	if conn, ok := v.uidToConns[uid]; ok {
+	if conn, ok := v.conn(uid); ok {
 		fn(conn)
 	}
 }
@@ -64,11 +85,12 @@ func (v *Varys) Setup(params SetupParams, _ *struct{}) error {
 }
 
 func (v *Varys) GetUIDToNicks(_ struct{}, result *map[string]string) error {
-	conns := v.uidToConns
-	m := make(map[string]string, len(conns))
-	for uid, conn := range conns {
+	v.mu.RLock()
+	m := make(map[string]string, len(v.uidToConns))
+	for uid, conn := range v.uidToConns {
 		m[uid] = conn.GetNick()
 	}
+	v.mu.RUnlock()
 	*result = m
 	return nil
 }
@@ -116,12 +138,22 @@ func (v *Varys) Connect(params ConnectParams, _ *struct{}) error {
 		conn.AddCallback(eventcode, callback)
 	}
 
+	// Register before connecting: callbacks (e.g. 001) can fire as soon as
+	// Connect starts its read loop, and they look the connection up by UID.
+	v.mu.Lock()
+	v.uidToConns[params.UID] = conn
+	v.mu.Unlock()
+
 	err := conn.Connect(v.connConfig.Server)
 	if err != nil {
+		v.mu.Lock()
+		if v.uidToConns[params.UID] == conn {
+			delete(v.uidToConns, params.UID)
+		}
+		v.mu.Unlock()
 		return fmt.Errorf("error opening irc connection: %w", err)
 	}
 
-	v.uidToConns[params.UID] = conn
 	go conn.Loop()
 	return nil
 }
@@ -132,13 +164,15 @@ type QuitParams struct {
 }
 
 func (v *Varys) QuitIfConnected(params QuitParams, _ *struct{}) error {
-	if conn, ok := v.uidToConns[params.UID]; ok {
-		if conn.Connected() {
-			conn.QuitMessage = params.QuitMessage
-			conn.Quit()
-		}
-	}
+	v.mu.Lock()
+	conn, ok := v.uidToConns[params.UID]
 	delete(v.uidToConns, params.UID)
+	v.mu.Unlock()
+
+	if ok && conn.Connected() {
+		conn.QuitMessage = params.QuitMessage
+		conn.Quit()
+	}
 	return nil
 }
 
@@ -165,14 +199,14 @@ func (v *Varys) SendRaw(params SendRawParams, _ *struct{}) error {
 }
 
 func (v *Varys) GetNick(uid string, result *string) error {
-	if conn, ok := v.uidToConns[uid]; ok {
+	if conn, ok := v.conn(uid); ok {
 		*result = conn.GetNick()
 	}
 	return nil
 }
 
 func (v *Varys) Connected(uid string, result *bool) error {
-	if conn, ok := v.uidToConns[uid]; ok {
+	if conn, ok := v.conn(uid); ok {
 		*result = conn.Connected()
 	}
 
@@ -185,7 +219,7 @@ type NickParams struct {
 }
 
 func (v *Varys) Nick(params NickParams, _ *struct{}) error {
-	if conn, ok := v.uidToConns[params.UID]; ok {
+	if conn, ok := v.conn(params.UID); ok {
 		conn.Nick(params.Nick)
 	}
 	return nil
