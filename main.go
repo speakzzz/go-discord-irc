@@ -97,7 +97,8 @@ func main() {
 		*insecure = viper.GetBool("insecure")
 	}
 	//
-	viper.SetDefault("irc_puppet_prejoin_commands", []string{"MODE ${NICK} +D"})
+	// ${DEAF} becomes the server's deaf user mode (DEAF in ISUPPORT, else d)
+	viper.SetDefault("irc_puppet_prejoin_commands", []string{"MODE ${NICK} +${DEAF}"})
 	ircPuppetPrejoinCommands := viper.GetStringSlice("irc_puppet_prejoin_commands") // Commands for each connection to send before joining channels
 	//
 	viper.SetDefault("avatar_url", "https://robohash.org/${USERNAME}.png?set=set4")
@@ -123,6 +124,9 @@ func main() {
 	// Maximum length of user nicks aloud
 	viper.SetDefault("max_nick_length", ircnick.MAXLENGTH)
 	maxNickLength := viper.GetInt("max_nick_length")
+	// How often to retry joining channels we are not in (0 disables)
+	viper.SetDefault("rejoin_interval", 300)
+	rejoinInterval := viper.GetInt64("rejoin_interval")
 
 	if webIRCPass == "" {
 		log.Warnln("webirc_pass is empty")
@@ -172,6 +176,7 @@ func main() {
 		CooldownDuration:           time.Second * time.Duration(cooldownDuration),
 		ShowJoinQuit:               showJoinQuit,
 		MaxNickLength:              maxNickLength,
+		RejoinInterval:             time.Second * time.Duration(rejoinInterval),
 
 		Debug:         *debugMode,
 		DebugPresence: *debugPresence,
@@ -209,32 +214,33 @@ func main() {
 			dib.SetIRCListenerName(ircUsername)
 		}
 
-		ircIgnores := viper.GetStringSlice("ignored_irc_hostmasks")
-		dib.Config.IRCIgnores = setupHostmaskMatchers(ircIgnores)
-
-		rawIRCFilter := viper.GetStringSlice("irc_message_filter")
-		rawDiscordFilter := viper.GetStringSlice("discord_message_filter")
-		dib.Config.DiscordFilteredMessages = setupFilter(rawDiscordFilter)
-		dib.Config.IRCFilteredMessages = setupFilter(rawIRCFilter)
-
+		// Build the new values first, then swap them in under the
+		// bridge's config lock (they are read from many goroutines).
+		ircIgnores := setupHostmaskMatchers(viper.GetStringSlice("ignored_irc_hostmasks"))
+		discordFilter := setupFilter(viper.GetStringSlice("discord_message_filter"))
+		ircFilter := setupFilter(viper.GetStringSlice("irc_message_filter"))
 		avatarURL := viper.GetString("avatar_url")
-		dib.Config.AvatarURL = avatarURL
+		discordIgnores := stringSliceToMap(viper.GetStringSlice("ignored_discord_ids"))
+
+		var discordAllowed map[string]struct{}
+		if rawDiscordAllowed := viper.GetStringSlice("allowed_discord_ids"); rawDiscordAllowed != nil {
+			discordAllowed = stringSliceToMap(rawDiscordAllowed)
+		}
+
+		dib.UpdateConfig(func(c *bridge.Config) {
+			c.IRCIgnores = ircIgnores
+			c.DiscordFilteredMessages = discordFilter
+			c.IRCFilteredMessages = ircFilter
+			c.AvatarURL = avatarURL
+			c.DiscordIgnores = discordIgnores
+			c.DiscordAllowed = discordAllowed
+		})
 
 		if debug := viper.GetBool("debug"); *debugMode != debug {
 			log.Printf("Debug changed from %+v to %+v", *debugMode, debug)
 			*debugMode = debug
 			dib.SetDebugMode(debug)
 			SetLogDebug(debug)
-		}
-
-		rawDiscordIgnores := viper.GetStringSlice("ignored_discord_ids")
-		dib.Config.DiscordIgnores = stringSliceToMap(rawDiscordIgnores)
-
-		rawDiscordAllowed := viper.GetStringSlice("allowed_discord_ids")
-		if rawDiscordAllowed == nil {
-			dib.Config.DiscordAllowed = nil
-		} else {
-			dib.Config.DiscordAllowed = stringSliceToMap(rawDiscordAllowed)
 		}
 
 		chans := viper.GetStringMapString("channel_mappings")

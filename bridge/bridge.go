@@ -70,13 +70,22 @@ type Config struct {
 	// Maximum Nicklength for irc server
 	MaxNickLength int
 
+	// RejoinInterval is how often to retry joining mapped channels that the
+	// listener or a puppet is not in. Zero disables retrying.
+	RejoinInterval time.Duration
+
 	Debug         bool
 	DebugPresence bool
 }
 
 // A Bridge represents a bridging between an IRC server and channels in a Discord server
 type Bridge struct {
-	Config *Config
+	// Config holds the bridge settings. Settings that can change while the
+	// bridge runs (filters, ignore/allow lists, avatar URL, debug, listener
+	// name) must be changed with UpdateConfig and read with the
+	// matching accessor, because they are read from many goroutines.
+	Config   *Config
+	configMu sync.RWMutex
 
 	discord     *discordBot
 	ircListener *ircListener
@@ -90,6 +99,9 @@ type Bridge struct {
 
 	done chan bool
 
+	// stopRejoin stops the rejoin loop when the bridge shuts down.
+	stopRejoin chan struct{}
+
 	discordMessagesChan      chan IRCMessage
 	discordMessageEventsChan chan *DiscordMessage
 	updateUserChan           chan DiscordUser
@@ -98,6 +110,27 @@ type Bridge struct {
 
 	emojiMu sync.RWMutex
 	emoji   map[string]*discordgo.Emoji
+}
+
+// UpdateConfig applies a change to the reloadable settings in Config while
+// holding the config lock. Use it instead of assigning Config fields directly
+// once the bridge is running.
+func (b *Bridge) UpdateConfig(fn func(c *Config)) {
+	b.configMu.Lock()
+	defer b.configMu.Unlock()
+	fn(b.Config)
+}
+
+// readConfig runs fn with the reloadable settings read-locked.
+func (b *Bridge) readConfig(fn func(c *Config)) {
+	b.configMu.RLock()
+	defer b.configMu.RUnlock()
+	fn(b.Config)
+}
+
+func (b *Bridge) avatarURL() (url string) {
+	b.readConfig(func(c *Config) { url = c.AvatarURL })
+	return
 }
 
 // Mappings returns a copy of the current channel mappings.
@@ -274,8 +307,9 @@ func (b *Bridge) SetChannelMappings(inMappings map[string]string) error {
 // New Bridge
 func New(conf *Config) (*Bridge, error) {
 	dib := &Bridge{
-		Config: conf,
-		done:   make(chan bool),
+		Config:     conf,
+		done:       make(chan bool),
+		stopRejoin: make(chan struct{}),
 
 		discordMessagesChan:      make(chan IRCMessage),
 		discordMessageEventsChan: make(chan *DiscordMessage),
@@ -309,13 +343,13 @@ func New(conf *Config) (*Bridge, error) {
 
 // SetIRCListenerName changes the username of the listener bot.
 func (b *Bridge) SetIRCListenerName(name string) {
-	b.Config.IRCListenerName = name
+	b.UpdateConfig(func(c *Config) { c.IRCListenerName = name })
 	b.ircListener.Nick(name)
 }
 
 // SetDebugMode allows you to control debug logging.
 func (b *Bridge) SetDebugMode(debug bool) {
-	b.Config.Debug = debug
+	b.UpdateConfig(func(c *Config) { c.Debug = debug })
 	b.ircListener.SetDebugMode(debug)
 }
 
@@ -335,6 +369,11 @@ func (b *Bridge) Open() (err error) {
 
 	// run listener loop
 	go b.ircListener.Loop()
+
+	// retry channels we fail to join
+	if b.Config.RejoinInterval > 0 {
+		go b.rejoinLoop(b.Config.RejoinInterval, b.stopRejoin)
+	}
 
 	return
 }
@@ -442,7 +481,7 @@ func (b *Bridge) loop() {
 				avatar = b.discord.GetAvatar(b.Config.GuildID, msg.Username)
 				if avatar == "" {
 					// If we don't have a Discord avatar, generate an adorable avatar
-					avatar = strings.ReplaceAll(b.Config.AvatarURL, "${USERNAME}", msg.Username)
+					avatar = strings.ReplaceAll(b.avatarURL(), "${USERNAME}", msg.Username)
 				}
 
 				if len(username) == 1 {
@@ -548,6 +587,7 @@ func (b *Bridge) loop() {
 
 		// Done!
 		case <-b.done:
+			close(b.stopRejoin)
 			b.discord.Close()
 			b.ircListener.Quit()
 			b.ircManager.Close()

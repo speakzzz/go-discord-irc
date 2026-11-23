@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gobwas/glob"
 	"github.com/mozillazg/go-unidecode"
 	"github.com/pkg/errors"
 
@@ -292,9 +293,22 @@ func (m *IRCManager) DisconnectUser(userID string) {
 
 var connectionsIgnored = 0
 
-func (m *IRCManager) ircIgnoredDiscord(user string) bool {
-	_, ret := m.bridge.Config.DiscordIgnores[user]
-	return ret
+func (m *IRCManager) ircIgnoredDiscord(user string) (ignored bool) {
+	m.bridge.readConfig(func(c *Config) { _, ignored = c.DiscordIgnores[user] })
+	return
+}
+
+// discordAllowed reports whether user may be bridged. A nil allow list means
+// everyone is allowed.
+func (m *IRCManager) discordAllowed(user string) (allowed bool) {
+	m.bridge.readConfig(func(c *Config) {
+		if c.DiscordAllowed == nil {
+			allowed = true
+			return
+		}
+		_, allowed = c.DiscordAllowed[user]
+	})
+	return
 }
 
 // HandleUser deals with messages sent from a DiscordUser
@@ -305,12 +319,10 @@ func (m *IRCManager) HandleUser(user DiscordUser) {
 		return
 	}
 
-	// If we have an allowed list of users at all
-	if allowed := m.bridge.Config.DiscordAllowed; allowed != nil {
-		// Short-circuit if they aren't in the list
-		if _, ok := allowed[user.ID]; !ok {
-			return
-		}
+	// If we have an allowed list of users at all, short-circuit if they
+	// aren't in it
+	if !m.discordAllowed(user.ID) {
+		return
 	}
 
 	// Does the user exist on the IRC side?
@@ -418,10 +430,7 @@ func (m *IRCManager) HandleUser(user DiscordUser) {
 
 		WebIRCSuffix: fmt.Sprintf("discord %s %s", hostname, ip),
 
-		Callbacks: map[string]func(*irc.Event){
-			"001":     safeCallback("puppet 001", con.OnWelcome),
-			"PRIVMSG": safeCallback("puppet PRIVMSG", con.OnPrivateMessage),
-		},
+		Callbacks: m.puppetCallbacks(con),
 	})
 	if err != nil {
 		log.WithError(err).WithField("nick", nick).Errorln("error opening irc connection")
@@ -430,6 +439,22 @@ func (m *IRCManager) HandleUser(user DiscordUser) {
 		m.CloseConnection(con)
 		return
 	}
+}
+
+// puppetCallbacks returns the IRC callbacks for a puppet connection.
+func (m *IRCManager) puppetCallbacks(con *ircConnection) map[string]func(*irc.Event) {
+	puppetName := func() string {
+		_, nick := con.snapshot()
+		return "puppet " + nick
+	}
+
+	callbacks := map[string]func(*irc.Event){}
+	for code, cb := range m.bridge.joinTrackingCallbacks(con.joins, puppetName) {
+		callbacks[code] = safeCallback("puppet "+code, cb)
+	}
+	callbacks["001"] = safeCallback("puppet 001", con.OnWelcome)
+	callbacks["PRIVMSG"] = safeCallback("puppet PRIVMSG", con.OnPrivateMessage)
+	return callbacks
 }
 
 // Converts a nickname to a sanitised form.
@@ -550,7 +575,7 @@ func (m *IRCManager) SendMessage(channel string, msg *DiscordMessage) {
 	// Person is appearing offline (or the bridge is running in Simple Mode)
 	if !ok {
 		listener := m.bridge.ircListener
-		prefix := fmt.Sprintf("<%s> ", discordTag(breakHighlight(msg.Author.Username), msg.Author.Discriminator))
+		prefix := relayPrefix(msg)
 		budget := ircMessageBudget(channel, len(listener.GetNick()), false) - len(prefix)
 
 		for _, line := range strings.Split(content, "\n") {
@@ -594,6 +619,19 @@ func (m *IRCManager) SendMessage(channel string, msg *DiscordMessage) {
 	}
 }
 
+// relayPrefix is the "<name> " put in front of lines the listener relays for
+// Discord users without a puppet. It shows the name people see on Discord,
+// adding the legacy #discriminator only when that name is the username.
+func relayPrefix(msg *DiscordMessage) string {
+	name := messageAuthorName(msg.Message)
+	if name == msg.Author.Username {
+		name = discordTag(breakHighlight(name), msg.Author.Discriminator)
+	} else {
+		name = breakHighlight(name)
+	}
+	return "<" + name + "> "
+}
+
 // RequestChannels finds all the Discord channels this user belongs to,
 // and then find pairings in the global pairings list
 // Currently just returns all participating IRC channels
@@ -602,31 +640,28 @@ func (m *IRCManager) RequestChannels(userID string) []Mapping {
 	return m.bridge.Mappings()
 }
 
-func (m *IRCManager) isIgnoredHostmask(mask string) bool {
-	for _, ban := range m.bridge.Config.IRCIgnores {
-		if ban.Match(mask) {
+func matchesAny(globs []glob.Glob, s string) bool {
+	for _, g := range globs {
+		if g.Match(s) {
 			return true
 		}
 	}
 	return false
 }
 
-func (m *IRCManager) isFilteredIRCMessage(txt string) bool {
-	for _, ban := range m.bridge.Config.IRCFilteredMessages {
-		if ban.Match(txt) {
-			return true
-		}
-	}
-	return false
+func (m *IRCManager) isIgnoredHostmask(mask string) (ignored bool) {
+	m.bridge.readConfig(func(c *Config) { ignored = matchesAny(c.IRCIgnores, mask) })
+	return
 }
 
-func (m *IRCManager) isFilteredDiscordMessage(txt string) bool {
-	for _, ban := range m.bridge.Config.DiscordFilteredMessages {
-		if ban.Match(txt) {
-			return true
-		}
-	}
-	return false
+func (m *IRCManager) isFilteredIRCMessage(txt string) (filtered bool) {
+	m.bridge.readConfig(func(c *Config) { filtered = matchesAny(c.IRCFilteredMessages, txt) })
+	return
+}
+
+func (m *IRCManager) isFilteredDiscordMessage(txt string) (filtered bool) {
+	m.bridge.readConfig(func(c *Config) { filtered = matchesAny(c.DiscordFilteredMessages, txt) })
+	return
 }
 
 func (m *IRCManager) generateUsername(discordUser DiscordUser) string {

@@ -23,7 +23,12 @@ type ircListener struct {
 	isonMu sync.Mutex
 	// welcomed is set (atomically) once we have received 001.
 	welcomed int32
+
+	// joins tracks which mapped channels the listener is really in.
+	joins *joinTracker
 }
+
+func (i *ircListener) isWelcomed() bool { return atomic.LoadInt32(&i.welcomed) == 1 }
 
 func newIRCListener(dib *Bridge, webIRCPass string) *ircListener {
 	irccon := irc.IRC(dib.Config.IRCListenerName, "discord")
@@ -31,6 +36,7 @@ func newIRCListener(dib *Bridge, webIRCPass string) *ircListener {
 		Connection:          irccon,
 		bridge:              dib,
 		listenerCallbackIDs: make(map[string]int),
+		joins:               newJoinTracker(),
 	}
 
 	dib.SetupIRCConnection(irccon, "discord.", "fd75:f5f5:226f::")
@@ -47,6 +53,12 @@ func newIRCListener(dib *Bridge, webIRCPass string) *ircListener {
 	irccon.AddCallback("PRIVMSG", safeCallback("listener PRIVMSG", listener.OnPrivateMessage))
 	irccon.AddCallback("NOTICE", safeCallback("listener NOTICE", listener.OnPrivateMessage))
 	irccon.AddCallback("CTCP_ACTION", safeCallback("listener CTCP_ACTION", listener.OnPrivateMessage))
+
+	// Track channel membership and log refused joins.
+	listenerName := func() string { return "listener " + listener.GetNick() }
+	for code, cb := range dib.joinTrackingCallbacks(listener.joins, listenerName) {
+		irccon.AddCallback(code, safeCallback("listener "+code, cb))
+	}
 
 	irccon.AddCallback("900", safeCallback("listener 900", func(e *irc.Event) {
 		// Try to rejoin channels after authenticated with NickServ
@@ -264,9 +276,10 @@ func (i *ircListener) SetDebugMode(debug bool) {
 
 func (i *ircListener) OnWelcome(e *irc.Event) {
 	atomic.StoreInt32(&i.welcomed, 1)
+	i.joins.reset()
 
 	// Execute prejoin commands
-	for _, com := range i.bridge.Config.IRCListenerPrejoinCommands {
+	for _, com := range i.bridge.expandPrejoin(i.bridge.Config.IRCListenerPrejoinCommands) {
 		i.SendRaw(strings.ReplaceAll(com, "${NICK}", i.GetNick()))
 	}
 

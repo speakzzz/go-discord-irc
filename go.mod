@@ -4,7 +4,7 @@ go 1.15
 
 require (
 	github.com/42wim/matterbridge v1.25.2
-	github.com/bwmarrin/discordgo v0.25.0
+	github.com/bwmarrin/discordgo v0.29.0
 	github.com/fsnotify/fsnotify v1.5.4
 	github.com/gobwas/glob v0.2.3
 	github.com/mozillazg/go-unidecode v0.1.1

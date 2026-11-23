@@ -154,8 +154,42 @@ func (v *Varys) Connect(params ConnectParams, _ *struct{}) error {
 		return fmt.Errorf("error opening irc connection: %w", err)
 	}
 
-	go conn.Loop()
+	go runConnection(conn)
 	return nil
+}
+
+// runConnection runs go-ircevent's reconnect loop. Loop only returns after
+// Quit, but if Quit happened while a reconnect attempt was in flight, that
+// attempt can still succeed, leaving a live connection nobody tracks. Close
+// it here so a quit puppet can never come back as a zombie.
+func runConnection(conn *irc.Connection) {
+	conn.Loop()
+	if conn.Connected() {
+		quit := "QUIT"
+		if conn.QuitMessage != "" {
+			quit += " :" + conn.QuitMessage
+		}
+		conn.SendRaw(quit)
+	}
+}
+
+// quitConnection marks conn as quitting so its reconnect loop stops.
+//
+// If conn is connected this sends QUIT as usual. If it is disconnected
+// (e.g. waiting between reconnect attempts), go-ircevent's Quit still has to
+// queue the QUIT line on the dead connection's write buffer, which could
+// block, so do it in the background.
+func quitConnection(conn *irc.Connection, message string) {
+	conn.QuitMessage = message
+	if conn.Connected() {
+		conn.Quit()
+		return
+	}
+
+	go func() {
+		defer func() { _ = recover() }() // write buffer may be closed
+		conn.Quit()
+	}()
 }
 
 type QuitParams struct {
@@ -169,9 +203,10 @@ func (v *Varys) QuitIfConnected(params QuitParams, _ *struct{}) error {
 	delete(v.uidToConns, params.UID)
 	v.mu.Unlock()
 
-	if ok && conn.Connected() {
-		conn.QuitMessage = params.QuitMessage
-		conn.Quit()
+	// Always quit, even if currently disconnected: otherwise go-ircevent
+	// keeps reconnecting it in the background as an untracked zombie.
+	if ok {
+		quitConnection(conn, params.QuitMessage)
 	}
 	return nil
 }
@@ -188,6 +223,12 @@ type SendRawParams struct {
 
 func (v *Varys) SendRaw(params SendRawParams, _ *struct{}) error {
 	v.connCall(params.UID, func(c *irc.Connection) {
+		// A disconnected connection's write buffer is not drained, so
+		// sending to it can block the caller indefinitely. Drop instead;
+		// channels are rejoined on reconnect anyway.
+		if !c.Connected() {
+			return
+		}
 		for _, msg := range params.Messages {
 			if params.Interpolation.Nick {
 				msg = strings.ReplaceAll(msg, "${NICK}", c.GetNick())
@@ -219,7 +260,7 @@ type NickParams struct {
 }
 
 func (v *Varys) Nick(params NickParams, _ *struct{}) error {
-	if conn, ok := v.conn(params.UID); ok {
+	if conn, ok := v.conn(params.UID); ok && conn.Connected() {
 		conn.Nick(params.Nick)
 	}
 	return nil

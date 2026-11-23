@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/qaisjp/go-discord-irc/irc/varys"
@@ -42,6 +43,11 @@ type ircConnection struct {
 
 	manager *IRCManager
 
+	// joins tracks which mapped channels this puppet is really in.
+	joins *joinTracker
+	// welcomed is set (atomically) once the server has sent 001.
+	welcomed int32
+
 	// PM state, guarded by pmMu (PRIVMSG callbacks run concurrently).
 	pmMu             sync.Mutex
 	pmDiscordChannel string // channel ID for their discord channel for PMs
@@ -57,9 +63,12 @@ func newIRCConnection(m *IRCManager, user DiscordUser, nick string) *ircConnecti
 		messages:         make(chan IRCMessage, messageQueueSize),
 		done:             make(chan struct{}),
 		manager:          m,
+		joins:            newJoinTracker(),
 		pmNoticedSenders: make(map[string]struct{}),
 	}
 }
+
+func (i *ircConnection) isWelcomed() bool { return atomic.LoadInt32(&i.welcomed) == 1 }
 
 // close stops the send loop and makes any pending enqueue give up.
 func (i *ircConnection) close() {
@@ -125,8 +134,12 @@ func (i *ircConnection) Connected() bool {
 }
 
 func (i *ircConnection) OnWelcome(e *irc.Event) {
+	atomic.StoreInt32(&i.welcomed, 1)
+	i.joins.reset()
+
 	// execute puppet prejoin commands
-	err := i.manager.varys.SendRaw(i.uid, varys.InterpolationParams{Nick: true}, i.manager.bridge.Config.IRCPuppetPrejoinCommands...)
+	prejoin := i.manager.bridge.expandPrejoin(i.manager.bridge.Config.IRCPuppetPrejoinCommands)
+	err := i.manager.varys.SendRaw(i.uid, varys.InterpolationParams{Nick: true}, prejoin...)
 	if err != nil {
 		log.WithError(err).WithField("discord", i.uid).Errorln("could not send puppet prejoin commands")
 	}

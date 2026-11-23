@@ -281,10 +281,10 @@ func (d *discordBot) ParseText(m *discordgo.Message) string {
 		username, _ := d.bridge.ircManager.nickForUID(user.ID)
 
 		if username == "" {
-			// Nickname is their username by default
-			nick := user.Username
+			// Nickname is their display name by default...
+			nick := userDisplayName(user)
 
-			// If we can get their member + nick, set nick to the real nick
+			// ...or their server nickname, if they have one
 			member, err := d.Session.State.Member(d.guildID, user.ID)
 			if err == nil && member.Nick != "" {
 				nick = member.Nick
@@ -449,7 +449,7 @@ func (d *discordBot) GetAvatar(guildID, username string) (_ string) {
 		if member.User == nil {
 			continue
 		}
-		if (username != member.Nick) && (username != member.User.Username) {
+		if !memberHasName(member, username, false) {
 			continue
 		}
 
@@ -467,7 +467,7 @@ func (d *discordBot) GetAvatar(guildID, username string) (_ string) {
 			if member.User == nil {
 				continue
 			}
-			if !strings.EqualFold(username, member.Nick) && !strings.EqualFold(username, member.User.Username) {
+			if !memberHasName(member, username, true) {
 				continue
 			}
 
@@ -505,10 +505,7 @@ func (d *discordBot) nameClashesWithMember(uid, nick string) bool {
 			continue
 		}
 
-		name := member.Nick
-		if member.Nick == "" {
-			name = member.User.Username
-		}
+		name := GetMemberNick(member)
 
 		if name == "" {
 			log.WithField("member", member).Errorln("blank username encountered")
@@ -522,13 +519,53 @@ func (d *discordBot) nameClashesWithMember(uid, nick string) bool {
 	return false
 }
 
-// GetMemberNick returns the real display name for a Discord GuildMember
+// GetMemberNick returns the name a Discord GuildMember is shown as in the
+// guild: their server nickname, else their global display name, else their
+// username.
 func GetMemberNick(m *discordgo.Member) string {
-	if m.Nick == "" {
-		return m.User.Username
+	if m.Nick != "" {
+		return m.Nick
 	}
+	if m.User == nil {
+		return ""
+	}
+	return userDisplayName(m.User)
+}
 
-	return m.Nick
+// userDisplayName returns a user's global display name, falling back to
+// their username for accounts (and bots) that have not set one.
+func userDisplayName(u *discordgo.User) string {
+	if u.GlobalName != "" {
+		return u.GlobalName
+	}
+	return u.Username
+}
+
+// messageAuthorName returns the name a message's author is shown as in the
+// guild (server nickname, display name, then username).
+func messageAuthorName(m *discordgo.Message) string {
+	if m.Member != nil && m.Member.Nick != "" {
+		return m.Member.Nick
+	}
+	if m.Author == nil {
+		return ""
+	}
+	return userDisplayName(m.Author)
+}
+
+// memberHasName reports whether name is the member's server nickname,
+// display name or username.
+func memberHasName(m *discordgo.Member, name string, foldCase bool) bool {
+	eq := func(a, b string) bool {
+		if a == "" {
+			return false
+		}
+		if foldCase {
+			return strings.EqualFold(a, b)
+		}
+		return a == b
+	}
+	return eq(m.Nick, name) || eq(m.User.GlobalName, name) || eq(m.User.Username, name)
 }
 
 // pmTargetFromContent returns an irc nick given a message sent to an IRC user via Discord
