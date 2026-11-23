@@ -55,6 +55,7 @@ func newDiscord(bridge *Bridge, botToken, guildID string) (*discordBot, error) {
 	discord.Session.AddHandler(discord.onMessageCreate)
 	discord.Session.AddHandler(discord.onMessageUpdate)
 	discord.Session.AddHandler(discord.onGuildEmojiUpdate)
+	discord.Session.AddHandler(discord.onThreadCreate)
 
 	if !bridge.Config.SimpleMode {
 		discord.Session.AddHandler(discord.onMemberListChunk)
@@ -119,6 +120,12 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 		return
 	}
 
+	// Discord's own "started a thread" notices; onThreadCreate announces
+	// threads instead.
+	if isThreadSystemMessage(m) {
+		return
+	}
+
 	// Work on a copy: m may be discordgo's cached state object, which other
 	// goroutines read, and we rewrite Content and Mentions below.
 	msgCopy := *m
@@ -166,6 +173,21 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 		content = spoilerPattern.ReplaceAllString(content, colorCode+"1,1$1"+colorCode)
 	}
 
+	// Messages in a thread (or forum post) go to the IRC channel of the
+	// thread's parent, tagged with the thread's name.
+	tag := ""
+	if m.GuildID != "" {
+		if _, mapped := d.bridge.GetMappingByDiscord(m.ChannelID); !mapped {
+			if parentID, name, isThread := d.threadParent(m.ChannelID); isThread {
+				if !d.bridge.bridgeDiscordThreads() {
+					return
+				}
+				m.ChannelID = parentID
+				tag = threadTag(name)
+			}
+		}
+	}
+
 	pmTarget := ""
 	// Blank guild means that it's a PM
 	if m.GuildID == "" {
@@ -196,25 +218,31 @@ func (d *discordBot) publishMessage(s *discordgo.Session, m *discordgo.Message, 
 		d.relayed.put(m.ID, content)
 	}
 
-	d.bridge.discordMessageEventsChan <- &DiscordMessage{
-		Message:  m,
-		Content:  content,
-		IsAction: isAction,
-		PmTarget: pmTarget,
+	send := func(text string, action bool) {
+		d.bridge.discordMessageEventsChan <- &DiscordMessage{
+			Message:  m,
+			Content:  prefixLines(text, tag),
+			IsAction: action,
+			PmTarget: pmTarget,
+		}
 	}
 
-	// Attachments were already relayed with the original message.
+	// Sticker-only or attachment-only messages have no text; sending an
+	// empty line would just make the IRC server complain.
+	if strings.TrimSpace(content) != "" {
+		send(content, isAction)
+	}
+
+	// Attachments etc. were already relayed with the original message.
 	if wasEdit {
 		return
 	}
 
 	for _, attachment := range m.Attachments {
-		d.bridge.discordMessageEventsChan <- &DiscordMessage{
-			Message:  m,
-			Content:  attachment.URL,
-			IsAction: isAction,
-			PmTarget: pmTarget,
-		}
+		send(attachment.URL, isAction)
+	}
+	for _, extra := range messageExtras(m) {
+		send(extra, false)
 	}
 }
 
@@ -234,6 +262,20 @@ func (d *discordBot) publishReaction(s *discordgo.Session, r *discordgo.MessageR
 		ChannelID: r.ChannelID,
 		Author:    user,
 		GuildID:   r.GuildID,
+	}
+
+	// Reactions in a thread go to the parent's IRC channel, tagged.
+	tag := ""
+	if m.GuildID != "" {
+		if _, mapped := d.bridge.GetMappingByDiscord(m.ChannelID); !mapped {
+			if parentID, name, isThread := d.threadParent(m.ChannelID); isThread {
+				if !d.bridge.bridgeDiscordThreads() {
+					return
+				}
+				m.ChannelID = parentID
+				tag = threadTag(name)
+			}
+		}
 	}
 
 	cachedMessage, err := dstate.ChannelMessage(d.Session, r.ChannelID, r.MessageID)
@@ -271,7 +313,7 @@ func (d *discordBot) publishReaction(s *discordgo.Session, r *discordgo.MessageR
 		// Custom emoji
 		emoji = fmt.Sprint(":", emoji, ":")
 	}
-	content := fmt.Sprint("reacted with ", emoji, reactionTarget)
+	content := fmt.Sprint(tag, "reacted with ", emoji, reactionTarget)
 
 	d.bridge.discordMessageEventsChan <- &DiscordMessage{
 		Message:  m,

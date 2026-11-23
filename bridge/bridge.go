@@ -82,6 +82,10 @@ type Config struct {
 	// TopicSync, TopicBoth or TopicOff.
 	IRCTopicToDiscord string
 
+	// DiscordThreads relays messages from Discord threads and forum posts to
+	// the IRC channel mapped to their parent channel.
+	DiscordThreads bool
+
 	// RejoinInterval is how often to retry joining mapped channels that the
 	// listener or a puppet is not in. Zero disables retrying.
 	RejoinInterval time.Duration
@@ -147,6 +151,11 @@ func (b *Bridge) avatarURL() (url string) {
 
 func (b *Bridge) convertDiscordMarkdown() (on bool) {
 	b.readConfig(func(c *Config) { on = c.DiscordMarkdownToIRC })
+	return
+}
+
+func (b *Bridge) bridgeDiscordThreads() (on bool) {
+	b.readConfig(func(c *Config) { on = c.DiscordThreads })
 	return
 }
 

@@ -24,10 +24,11 @@ func newTestBridge(t *testing.T) *Bridge {
 			MaxNickLength:    30,
 			CooldownDuration: time.Hour,
 		},
-		updateUserChan:      make(chan DiscordUser, 16),
-		discordMessagesChan: make(chan IRCMessage, 16),
-		cooldownExpiredChan: make(chan cooldownExpiry, 16),
-		emoji:               map[string]*discordgo.Emoji{},
+		updateUserChan:           make(chan DiscordUser, 16),
+		discordMessagesChan:      make(chan IRCMessage, 16),
+		discordMessageEventsChan: make(chan *DiscordMessage, 16),
+		cooldownExpiredChan:      make(chan cooldownExpiry, 16),
+		emoji:                    map[string]*discordgo.Emoji{},
 	}
 
 	state := discordgo.NewState()

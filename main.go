@@ -126,6 +126,8 @@ func main() {
 	maxNickLength := viper.GetInt("max_nick_length")
 	// Discord **markdown** -> IRC formatting codes
 	viper.SetDefault("discord_markdown", true)
+	// Relay Discord threads/forum posts to their parent channel's IRC channel
+	viper.SetDefault("discord_threads", true)
 	// How Discord edits reach IRC: full, compact or off
 	viper.SetDefault("discord_edits", bridge.EditsCompact)
 	// How IRC topic changes reach Discord: message, topic, both or off
@@ -185,6 +187,7 @@ func main() {
 		MaxNickLength:              maxNickLength,
 		RejoinInterval:             time.Second * time.Duration(rejoinInterval),
 		DiscordMarkdownToIRC:       viper.GetBool("discord_markdown"),
+		DiscordThreads:             viper.GetBool("discord_threads"),
 		DiscordEdits:               checkChoice("discord_edits", viper.GetString("discord_edits"), bridge.EditsCompact, bridge.EditsFull, bridge.EditsCompact, bridge.EditsOff),
 		IRCTopicToDiscord:          checkChoice("irc_topic_to_discord", viper.GetString("irc_topic_to_discord"), bridge.TopicMessage, bridge.TopicMessage, bridge.TopicSync, bridge.TopicBoth, bridge.TopicOff),
 
@@ -231,6 +234,7 @@ func main() {
 		ircFilter := setupFilter(viper.GetStringSlice("irc_message_filter"))
 		avatarURL := viper.GetString("avatar_url")
 		discordMarkdown := viper.GetBool("discord_markdown")
+		discordThreads := viper.GetBool("discord_threads")
 		discordEdits := checkChoice("discord_edits", viper.GetString("discord_edits"), bridge.EditsCompact, bridge.EditsFull, bridge.EditsCompact, bridge.EditsOff)
 		topicMode := checkChoice("irc_topic_to_discord", viper.GetString("irc_topic_to_discord"), bridge.TopicMessage, bridge.TopicMessage, bridge.TopicSync, bridge.TopicBoth, bridge.TopicOff)
 		discordIgnores := stringSliceToMap(viper.GetStringSlice("ignored_discord_ids"))
@@ -246,6 +250,7 @@ func main() {
 			c.IRCFilteredMessages = ircFilter
 			c.AvatarURL = avatarURL
 			c.DiscordMarkdownToIRC = discordMarkdown
+			c.DiscordThreads = discordThreads
 			c.DiscordEdits = discordEdits
 			c.IRCTopicToDiscord = topicMode
 			c.DiscordIgnores = discordIgnores
